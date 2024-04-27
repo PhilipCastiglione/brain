@@ -1,111 +1,74 @@
 import gleam/erlang/process.{type Subject}
-import gleam/io
-import gleam/list
+import gleam/option.{type Option, None, Some}
 import gleam/otp/actor
-
-type Signal {
-  SensorSignal(input: String)
-  NeuronSignal(signal: Int)
-  // EffectorSignal(output: String)
-  AddInwardConnection(neuron: Subject(Signal))
-  AddOutwardConnection(neuron: Subject(Signal))
+import gleam/otp/supervisor.{Spec, add, worker}
+import neuron.{
+  AddOutwardConnection, EffectorNeuron, Interneuron, SensorSignal, SensoryNeuron,
 }
 
-type NeuronKind {
-  SensoryNeuron
-  Interneuron
-  EffectorNeuron
-}
-
-type State {
-  State(
-    threshold: Int,
-    kind: NeuronKind,
-    inward_connections: List(Subject(Signal)),
-    outward_connections: List(Subject(Signal)),
-  )
-}
-
-fn handle_signal(signal: Signal, state: State) {
-  case signal {
-    SensorSignal(input) -> {
-      case state.kind {
-        SensoryNeuron -> {
-          io.debug("Received sensor signal:")
-          io.debug(input)
-          list.each(state.outward_connections, actor.send(_, NeuronSignal(2)))
-          actor.continue(state)
-        }
-        _ -> {
-          io.debug("Received sensor signal but I'm not a sensory neuron")
-          actor.continue(state)
-        }
-      }
-    }
-    NeuronSignal(signal) -> {
-      case state.kind {
-        SensoryNeuron -> {
-          io.debug("Received neuron signal but I'm a sensory neuron")
-          actor.continue(state)
-        }
-        Interneuron -> {
-          io.debug("Received neuron signal:")
-          io.debug(signal)
-          list.each(state.outward_connections, actor.send(_, NeuronSignal(1)))
-          actor.continue(state)
-        }
-        EffectorNeuron -> {
-          io.debug("Received neuron signal:")
-          io.debug(signal)
-          io.println("***Significant brain output!***")
-          actor.continue(state)
-        }
-      }
-    }
-    AddInwardConnection(neuron) -> {
-      io.debug("Adding inward connection")
-      io.debug(neuron)
-      actor.continue(
-        State(..state, inward_connections: [neuron, ..state.inward_connections]),
-      )
-    }
-    AddOutwardConnection(neuron) -> {
-      io.debug("Adding outward connection")
-      io.debug(neuron)
-      actor.continue(
-        State(
-          ..state,
-          outward_connections: [neuron, ..state.outward_connections],
-        ),
-      )
-    }
+// helper function to collect the started children
+// i have no idea whether this is a good way to get the children out, 
+// but it would scale to multiple actor types using supervisor.returning
+fn get_neurons(
+  selector: process.Selector(Option(Subject(neuron.Message))),
+) -> List(Subject(neuron.Message)) {
+  case process.select_forever(selector) {
+    None -> []
+    Some(neuron) -> [neuron, ..get_neurons(selector)]
   }
 }
 
-pub fn main() {
-  io.println("Starting brain!")
+// create neurons, with just a single supervisor for now
+fn grow_brain() -> List(Subject(neuron.Message)) {
+  let receive_neuron = process.new_subject()
+  let receive_end = process.new_subject()
 
-  let assert Ok(sensory_neuron) =
-    actor.start(State(10, SensoryNeuron, [], []), handle_signal)
+  let channel =
+    process.new_selector()
+    |> process.selecting(receive_neuron, fn(n) { Some(n) })
+    |> process.selecting(receive_end, fn(_) { None })
 
-  let assert Ok(interneuron_1) =
-    actor.start(State(10, Interneuron, [], []), handle_signal)
+  let assert Ok(_) =
+    supervisor.start_spec(Spec(
+      init: fn(children) {
+        children
+        |> add(worker(neuron.start(_, SensoryNeuron, 10)))
+        |> add(worker(neuron.start(_, Interneuron, 10)))
+        |> add(worker(neuron.start(_, Interneuron, 10)))
+        |> add(worker(neuron.start(_, EffectorNeuron, 10)))
+      },
+      argument: receive_neuron,
+      max_frequency: 1,
+      frequency_period: 5,
+    ))
 
-  let assert Ok(interneuron_2) =
-    actor.start(State(10, Interneuron, [], []), handle_signal)
+  process.send(receive_end, Nil)
+  get_neurons(channel)
+}
 
-  let assert Ok(effector_neuron) =
-    actor.start(State(10, EffectorNeuron, [], []), handle_signal)
+fn run_experiment(neurons: List(Subject(neuron.Message))) {
+  let assert [sensory_neuron, interneuron_1, interneuron_2, effector_neuron] =
+    neurons
 
   actor.send(sensory_neuron, AddOutwardConnection(interneuron_1))
   actor.send(interneuron_1, AddOutwardConnection(interneuron_2))
   actor.send(interneuron_2, AddOutwardConnection(effector_neuron))
-
-  // inward connections don't do anything yet
-
   actor.send(sensory_neuron, SensorSignal("Hello lol"))
 
-  io.println("Main thread now sleeping forever...")
+  process.sleep_forever()
+}
+
+// run everything outside the main process, so that we can log top-level errors
+pub fn main() {
+  process.trap_exits(True)
+
+  process.start(
+    fn() {
+      let neurons = grow_brain()
+      run_experiment(neurons)
+    },
+    linked: True,
+  )
 
   process.sleep_forever()
 }
